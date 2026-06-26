@@ -2,10 +2,21 @@ require('dotenv').config();
 const express = require('express');
 const { ethers } = require('ethers');
 const cors = require('cors');
+// ★追加：連打防止ライブラリの読み込み
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ★追加：署名API用の厳しいレートリミット（1分間に10回まで）
+const signatureLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000, // 1分間
+    max: 10, // 1つのIPアドレスにつき10回まで
+    message: { error: "Too many signature requests. Please try again later.\n（署名リクエストが多すぎます。しばらく待ってから再試行してください）" },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
 
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS; // ★必ずRender等の環境変数でV5の新しいアドレスに更新してください！
@@ -49,7 +60,8 @@ async function retryCall(fn, name = "Request", retries = 3) {
     }
 }
 
-app.post('/get-signature', async (req, res) => {
+// ★修正：APIエンドポイントに signatureLimiter を適用
+app.post('/get-signature', signatureLimiter, async (req, res) => {
     try {
         const { userAddress, fromToken, toToken, fromAmount, nonce } = req.body;
 
