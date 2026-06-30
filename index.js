@@ -7,9 +7,6 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-// ★追加：Render等のプロキシ環境下でクライアントの正しいIPを取得するために必須
-// これがないとロードバランサーのIPが判定され、1人が連打すると全ユーザーがロックされます
 app.set('trust proxy', 1);
 
 const signatureLimiter = rateLimit({
@@ -37,6 +34,7 @@ app.get('/api/health', (req, res) => {
     res.status(200).json({ status: "ok", message: "Swap Server is awake!" });
 });
 
+// ★ ABIに isPaused を追加
 const ABI = [
     "function canDeposit(address) view returns (bool)",
     "function canWithdraw(address) view returns (bool)",
@@ -44,16 +42,16 @@ const ABI = [
     "function maxSwapAmountUSD() view returns (uint256)",
     "function getStock(address) view returns (uint256)",
     "function nonces(address) view returns (uint256)",
-    "function getSupportedTokens() view returns (address[])"
+    "function getSupportedTokens() view returns (address[])",
+    "function isPaused() view returns (bool)"
 ];
 
 const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
 
 async function retryCall(fn, name = "Request", retries = 3) {
     for (let i = 0; i < retries; i++) {
-        try {
-            return await fn();
-        } catch (err) {
+        try { return await fn(); }
+        catch (err) {
             console.error(`[${name}] Attempt ${i + 1} failed:`, err.message);
             if (i === retries - 1) throw err;
             await new Promise(r => setTimeout(r, 2000));
@@ -74,29 +72,32 @@ app.post('/get-signature', signatureLimiter, async (req, res) => {
         const cleanTo = ethers.getAddress(toToken);
         const fromAmountBI = BigInt(fromAmount);
 
-        // ★修正：6つの独立したRPC通信を Promise.all で並列実行し、待機時間を大幅に削減
+        // ★ 通信に isPaused の確認を追加
         const [
             isDepositAllowed,
             isWithdrawAllowed,
             fromRateRaw,
             toRateRaw,
             maxSwapUSDRaw,
-            actualStockRaw
+            actualStockRaw,
+            systemPaused // 追加
         ] = await Promise.all([
             retryCall(() => contract.canDeposit(cleanFrom), "checkDeposit"),
             retryCall(() => contract.canWithdraw(cleanTo), "checkWithdraw"),
             retryCall(() => contract.tokenRates(cleanFrom), "getFromRate"),
             retryCall(() => contract.tokenRates(cleanTo), "getToRate"),
             retryCall(() => contract.maxSwapAmountUSD(), "getMaxSwap"),
-            retryCall(() => contract.getStock(cleanTo), "getStock")
+            retryCall(() => contract.getStock(cleanTo), "getStock"),
+            retryCall(() => contract.isPaused(), "checkPause") // 追加
         ]);
 
-        if (!isDepositAllowed) {
-            return res.status(400).json({ error: "This element cannot be used as a catalyst.\n（この素材は錬成陣に捧げることができません）" });
+        // ★ Pause中なら署名を発行せずにここで弾く
+        if (systemPaused) {
+            return res.status(400).json({ error: "System is currently paused for maintenance.\n（現在システムはメンテナンス等により一時停止中です）" });
         }
-        if (!isWithdrawAllowed) {
-            return res.status(400).json({ error: "This element cannot be extracted from the array.\n（この素材は錬成陣から抽出できません）" });
-        }
+
+        if (!isDepositAllowed) return res.status(400).json({ error: "This element cannot be used as a catalyst." });
+        if (!isWithdrawAllowed) return res.status(400).json({ error: "This element cannot be extracted from the array." });
 
         // 1. レート取得（18桁整数）
         const fromRate = BigInt(fromRateRaw);
@@ -108,7 +109,7 @@ app.post('/get-signature', signatureLimiter, async (req, res) => {
         const fromAmountUSD = (fromAmountBI * fromRate) / BigInt(1e18);
         const maxSwapUSD = BigInt(maxSwapUSDRaw);
 
-        if (fromAmountUSD > maxSwapUSD) return res.status(400).json({ error: "Exceeds max swap amount\n スワップ最大取引数量エラー" });
+        if (fromAmountUSD > maxSwapUSD) return res.status(400).json({ error: "Exceeds max swap amount" });
 
         // 3. 数量計算と在庫チェック
         const toAmountBI = (fromAmountBI * fromRate) / toRate;
@@ -120,7 +121,6 @@ app.post('/get-signature', signatureLimiter, async (req, res) => {
         const stockReadable = ethers.formatUnits(actualStock, 18);
 
         if (actualStock < toAmountBI) {
-            console.log(`Insufficient Stock: Required ${toReadable} > Available ${stockReadable}`);
             return res.status(400).json({
                 error: "Insufficient liquidity",
                 message: `在庫不足: 必要量 ${toReadable} / 在庫 ${stockReadable}`
@@ -133,8 +133,6 @@ app.post('/get-signature', signatureLimiter, async (req, res) => {
             [cleanUser, cleanFrom, cleanTo, fromAmountBI, toAmountBI, BigInt(nonce)]
         );
         const signature = await wallet.signMessage(ethers.toBeArray(messageHash));
-
-        console.log(`Success: Generated signature for ${fromReadable} -> ${toReadable}`);
 
         res.json({
             toAmount: toAmountBI.toString(),
