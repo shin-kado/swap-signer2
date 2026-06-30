@@ -2,14 +2,16 @@ require('dotenv').config();
 const express = require('express');
 const { ethers } = require('ethers');
 const cors = require('cors');
-// ★追加：連打防止ライブラリの読み込み
 const rateLimit = require('express-rate-limit');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ★追加：署名API用の厳しいレートリミット（1分間に10回まで）
+// ★追加：Render等のプロキシ環境下でクライアントの正しいIPを取得するために必須
+// これがないとロードバランサーのIPが判定され、1人が連打すると全ユーザーがロックされます
+app.set('trust proxy', 1);
+
 const signatureLimiter = rateLimit({
     windowMs: 1 * 60 * 1000, // 1分間
     max: 10, // 1つのIPアドレスにつき10回まで
@@ -19,7 +21,7 @@ const signatureLimiter = rateLimit({
 });
 
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
-const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS; // ★必ずRender等の環境変数でV5の新しいアドレスに更新してください！
+const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
 const RPC_URL = process.env.RPC_URL_ROBINHOOD || "https://rpc.testnet.chain.robinhood.com";
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
@@ -35,7 +37,6 @@ app.get('/api/health', (req, res) => {
     res.status(200).json({ status: "ok", message: "Swap Server is awake!" });
 });
 
-// ★修正：V5のABIに合わせて更新
 const ABI = [
     "function canDeposit(address) view returns (bool)",
     "function canWithdraw(address) view returns (bool)",
@@ -60,7 +61,6 @@ async function retryCall(fn, name = "Request", retries = 3) {
     }
 }
 
-// ★修正：APIエンドポイントに signatureLimiter を適用
 app.post('/get-signature', signatureLimiter, async (req, res) => {
     try {
         const { userAddress, fromToken, toToken, fromAmount, nonce } = req.body;
@@ -74,9 +74,22 @@ app.post('/get-signature', signatureLimiter, async (req, res) => {
         const cleanTo = ethers.getAddress(toToken);
         const fromAmountBI = BigInt(fromAmount);
 
-        // ★新規追加：V5の一方向スワップのサーバー側バリデーション
-        const isDepositAllowed = await retryCall(() => contract.canDeposit(cleanFrom), "checkDeposit");
-        const isWithdrawAllowed = await retryCall(() => contract.canWithdraw(cleanTo), "checkWithdraw");
+        // ★修正：6つの独立したRPC通信を Promise.all で並列実行し、待機時間を大幅に削減
+        const [
+            isDepositAllowed,
+            isWithdrawAllowed,
+            fromRateRaw,
+            toRateRaw,
+            maxSwapUSDRaw,
+            actualStockRaw
+        ] = await Promise.all([
+            retryCall(() => contract.canDeposit(cleanFrom), "checkDeposit"),
+            retryCall(() => contract.canWithdraw(cleanTo), "checkWithdraw"),
+            retryCall(() => contract.tokenRates(cleanFrom), "getFromRate"),
+            retryCall(() => contract.tokenRates(cleanTo), "getToRate"),
+            retryCall(() => contract.maxSwapAmountUSD(), "getMaxSwap"),
+            retryCall(() => contract.getStock(cleanTo), "getStock")
+        ]);
 
         if (!isDepositAllowed) {
             return res.status(400).json({ error: "This element cannot be used as a catalyst.\n（この素材は錬成陣に捧げることができません）" });
@@ -86,19 +99,20 @@ app.post('/get-signature', signatureLimiter, async (req, res) => {
         }
 
         // 1. レート取得（18桁整数）
-        const fromRate = BigInt(await retryCall(() => contract.tokenRates(cleanFrom), "getFromRate"));
-        const toRate = BigInt(await retryCall(() => contract.tokenRates(cleanTo), "getToRate"));
+        const fromRate = BigInt(fromRateRaw);
+        const toRate = BigInt(toRateRaw);
 
         if (toRate === 0n) return res.status(400).json({ error: "Invalid toToken rate" });
 
         // 2. スワップ上限チェック
         const fromAmountUSD = (fromAmountBI * fromRate) / BigInt(1e18);
-        const maxSwapUSD = BigInt(await retryCall(() => contract.maxSwapAmountUSD(), "getMaxSwap"));
+        const maxSwapUSD = BigInt(maxSwapUSDRaw);
+
         if (fromAmountUSD > maxSwapUSD) return res.status(400).json({ error: "Exceeds max swap amount\n スワップ最大取引数量エラー" });
 
         // 3. 数量計算と在庫チェック
         const toAmountBI = (fromAmountBI * fromRate) / toRate;
-        const actualStock = BigInt(await retryCall(() => contract.getStock(cleanTo), "getStock"));
+        const actualStock = BigInt(actualStockRaw);
 
         // ログ用のフォーマット
         const fromReadable = ethers.formatUnits(fromAmountBI, 18);
