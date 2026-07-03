@@ -61,12 +61,37 @@ async function retryCall(fn, name = "Request", retries = 3) {
 
 app.post('/get-signature', signatureLimiter, async (req, res) => {
     try {
-        const { userAddress, fromToken, toToken, fromAmount, nonce } = req.body;
+        // ★変更：リクエストボディに cfToken を追加
+        const { userAddress, fromToken, toToken, fromAmount, nonce, cfToken } = req.body;
 
         if (!userAddress || !fromToken || !toToken || !fromAmount || !nonce) {
             return res.status(400).json({ error: "Missing parameters" });
         }
 
+        // ★追加：Turnstile（Bot検証）の厳格なチェック
+        if (!cfToken) {
+            return res.status(400).json({ error: "Bot verification token is missing. / 検証トークンが見つかりません。" });
+        }
+        try {
+            const cfFormData = new URLSearchParams();
+            cfFormData.append('secret', process.env.TURNSTILE_SECRET_KEY);
+            cfFormData.append('response', cfToken);
+
+            const cfResponse = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+                method: 'POST',
+                body: cfFormData,
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+            });
+            const cfData = await cfResponse.json();
+            if (!cfData.success) {
+                return res.status(403).json({ error: "Bot verification failed. / セキュリティ検証に失敗しました。" });
+            }
+        } catch (cfErr) {
+            console.error("Turnstile API Error:", cfErr.message);
+            return res.status(500).json({ error: "Internal security verification timeout. / 検証サーバー通信エラー" });
+        }
+
+        // --- 以降の既存ロジック（cleanUserの定義など）はそのまま継続 ---
         const cleanUser = ethers.getAddress(userAddress);
         const cleanFrom = ethers.getAddress(fromToken);
         const cleanTo = ethers.getAddress(toToken);
