@@ -5,7 +5,13 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
-app.use(cors());
+
+// ★改修1: CORS（アクセス制限）を環境変数から取得してホワイトリスト化
+const corsOptions = {
+    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    methods: ["GET", "POST"]
+};
+app.use(cors(corsOptions));
 app.use(express.json());
 app.set('trust proxy', 1);
 
@@ -34,7 +40,6 @@ app.get('/api/health', (req, res) => {
     res.status(200).json({ status: "ok", message: "Swap Server is awake!" });
 });
 
-// ★ ABIに isPaused を追加
 const ABI = [
     "function canDeposit(address) view returns (bool)",
     "function canWithdraw(address) view returns (bool)",
@@ -59,16 +64,39 @@ async function retryCall(fn, name = "Request", retries = 3) {
     }
 }
 
+// ★改修3: RPC負荷対策（全体設定のキャッシュ化）
+// maxSwapAmountUSD と isPaused はユーザーごとに変わらないため、1分に1回だけ取得して使い回す
+let systemCache = {
+    maxSwapUSD: 0n,
+    isPaused: false,
+    lastUpdated: 0
+};
+
+async function updateSystemCache() {
+    try {
+        const [maxSwap, paused] = await Promise.all([
+            retryCall(() => contract.maxSwapAmountUSD(), "getMaxSwap"),
+            retryCall(() => contract.isPaused(), "checkPause")
+        ]);
+        systemCache.maxSwapUSD = BigInt(maxSwap);
+        systemCache.isPaused = paused;
+        systemCache.lastUpdated = Date.now();
+    } catch (e) {
+        console.error("Cache update failed:", e.message);
+    }
+}
+// 起動時に1回取得し、その後は1分間隔で更新
+updateSystemCache();
+setInterval(updateSystemCache, 60 * 1000);
+
 app.post('/get-signature', signatureLimiter, async (req, res) => {
     try {
-        // ★変更：リクエストボディに cfToken を追加
         const { userAddress, fromToken, toToken, fromAmount, nonce, cfToken } = req.body;
 
-        if (!userAddress || !fromToken || !toToken || !fromAmount || !nonce) {
+        if (!userAddress || !fromToken || !toToken || !fromAmount || nonce === undefined) {
             return res.status(400).json({ error: "Missing parameters" });
         }
 
-        // ★追加：Turnstile（Bot検証）の厳格なチェック
         if (!cfToken) {
             return res.status(400).json({ error: "Bot verification token is missing. / 検証トークンが見つかりません。" });
         }
@@ -91,38 +119,40 @@ app.post('/get-signature', signatureLimiter, async (req, res) => {
             return res.status(500).json({ error: "Internal security verification timeout. / 検証サーバー通信エラー" });
         }
 
-        // --- 以降の既存ロジック（cleanUserの定義など）はそのまま継続 ---
+        // キャッシュのデータを使用してPauseをチェック
+        if (systemCache.isPaused) {
+            return res.status(400).json({ error: "System is currently paused for maintenance.\n（現在システムはメンテナンス等により一時停止中です）" });
+        }
+
         const cleanUser = ethers.getAddress(userAddress);
         const cleanFrom = ethers.getAddress(fromToken);
         const cleanTo = ethers.getAddress(toToken);
         const fromAmountBI = BigInt(fromAmount);
 
-        // ★ 通信に isPaused の確認を追加
+        // ★改修2・3: 必要な情報（個人・トークンごと）のみをブロックチェーンから取得し、Nonceも検証する
         const [
             isDepositAllowed,
             isWithdrawAllowed,
             fromRateRaw,
             toRateRaw,
-            maxSwapUSDRaw,
             actualStockRaw,
-            systemPaused // 追加
+            currentNonceRaw // ★追加: コントラクト側の正しいNonceを取得
         ] = await Promise.all([
             retryCall(() => contract.canDeposit(cleanFrom), "checkDeposit"),
             retryCall(() => contract.canWithdraw(cleanTo), "checkWithdraw"),
             retryCall(() => contract.tokenRates(cleanFrom), "getFromRate"),
             retryCall(() => contract.tokenRates(cleanTo), "getToRate"),
-            retryCall(() => contract.maxSwapAmountUSD(), "getMaxSwap"),
             retryCall(() => contract.getStock(cleanTo), "getStock"),
-            retryCall(() => contract.isPaused(), "checkPause") // 追加
+            retryCall(() => contract.nonces(cleanUser), "getNonce") // ★追加
         ]);
-
-        // ★ Pause中なら署名を発行せずにここで弾く
-        if (systemPaused) {
-            return res.status(400).json({ error: "System is currently paused for maintenance.\n（現在システムはメンテナンス等により一時停止中です）" });
-        }
 
         if (!isDepositAllowed) return res.status(400).json({ error: "This element cannot be used as a catalyst." });
         if (!isWithdrawAllowed) return res.status(400).json({ error: "This element cannot be extracted from the array." });
+
+        // ★改修2: Nonce（整理券番号）が正しいか厳密にチェック
+        if (BigInt(currentNonceRaw) !== BigInt(nonce)) {
+            return res.status(400).json({ error: "Invalid transaction sequence (Nonce mismatch). Please refresh the page.\n（トランザクションの順序が不正です。画面を更新してください）" });
+        }
 
         // 1. レート取得（18桁整数）
         const fromRate = BigInt(fromRateRaw);
@@ -132,20 +162,15 @@ app.post('/get-signature', signatureLimiter, async (req, res) => {
 
         // 2. スワップ上限チェック
         const fromAmountUSD = (fromAmountBI * fromRate) / BigInt(1e18);
-        const maxSwapUSD = BigInt(maxSwapUSDRaw);
-
-        if (fromAmountUSD > maxSwapUSD) return res.status(400).json({ error: "Exceeds max swap amount" });
+        if (fromAmountUSD > systemCache.maxSwapUSD) return res.status(400).json({ error: "Exceeds max swap amount" });
 
         // 3. 数量計算と在庫チェック
         const toAmountBI = (fromAmountBI * fromRate) / toRate;
         const actualStock = BigInt(actualStockRaw);
 
-        // ログ用のフォーマット
-        const fromReadable = ethers.formatUnits(fromAmountBI, 18);
-        const toReadable = ethers.formatUnits(toAmountBI, 18);
-        const stockReadable = ethers.formatUnits(actualStock, 18);
-
         if (actualStock < toAmountBI) {
+            const toReadable = ethers.formatUnits(toAmountBI, 18);
+            const stockReadable = ethers.formatUnits(actualStock, 18);
             return res.status(400).json({
                 error: "Insufficient liquidity",
                 message: `在庫不足: 必要量 ${toReadable} / 在庫 ${stockReadable}`
@@ -157,7 +182,9 @@ app.post('/get-signature', signatureLimiter, async (req, res) => {
             ["address", "address", "address", "uint256", "uint256", "uint256"],
             [cleanUser, cleanFrom, cleanTo, fromAmountBI, toAmountBI, BigInt(nonce)]
         );
-        const signature = await wallet.signMessage(ethers.toBeArray(messageHash));
+
+        // ★改修1: Ethers.js v6の正しいメソッド (getBytes) を使用
+        const signature = await wallet.signMessage(ethers.getBytes(messageHash));
 
         res.json({
             toAmount: toAmountBI.toString(),
