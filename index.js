@@ -7,10 +7,21 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 
 // ★改修1: CORS（アクセス制限）を環境変数から取得してホワイトリスト化
+const allowedOrigins = process.env.FRONTEND_URL
+    ? process.env.FRONTEND_URL.split(',').map(url => url.trim())
+    : ["http://localhost:3000"];
+
 const corsOptions = {
-    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    origin: function (origin, callback) {
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('CORSエラー: 許可されていないURLからのアクセスです'));
+        }
+    },
     methods: ["GET", "POST"]
 };
+
 app.use(cors(corsOptions));
 app.use(express.json());
 app.set('trust proxy', 1);
